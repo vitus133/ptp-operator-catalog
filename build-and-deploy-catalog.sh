@@ -208,6 +208,41 @@ ensure_tools() {
 
     export PATH="${TOOLS_BIN}:${PATH}"
     ok "Toolchain ready (opm ${OPM_VERSION} + yq on PATH)"
+
+    # controller-gen is go-installed by the Makefile and can break with a
+    # too-new toolchain (legacy v0.15.0 + x/tools v0.20.0). Pre-install the
+    # repo's pinned version so the Makefile short-circuits.
+    ensure_controller_gen
+}
+
+# --- Ensure the repo's pinned controller-gen is present ---
+# The legacy repo pins v0.15.0 whose x/tools v0.20.0 dependency fails to
+# build with Go >= 1.25 ("invalid array length -delta * delta").  Install
+# it into bin/ up-front so the Makefile's controller-gen version check
+# short-circuits and never runs its own (failing) go install.  If the
+# default toolchain fails, retry with an older one via GOTOOLCHAIN.
+ensure_controller_gen() {
+    local cg_pin
+    cg_pin="$(sed -nE 's/^CONTROLLER_TOOLS_VERSION[[:space:]]*\??=[[:space:]]*//p' \
+        "${PTP_OP_DIR}/Makefile" | head -1)"
+    [[ -n "${cg_pin}" ]] || return 0
+
+    if [[ -x "${TOOLS_BIN}/controller-gen" ]] && \
+        "${TOOLS_BIN}/controller-gen" --version 2>/dev/null | grep -q "${cg_pin#v}"; then
+        ok "controller-gen ${cg_pin} already present"
+        return 0
+    fi
+
+    info "Installing controller-gen ${cg_pin}"
+    if ! (cd "${PTP_OP_DIR}" && \
+            GOFLAGS=-mod=mod GOBIN="${TOOLS_BIN}" \
+            go install "sigs.k8s.io/controller-tools/cmd/controller-gen@${cg_pin}"); then
+        info "controller-gen build failed with default Go toolchain; retrying with GOTOOLCHAIN=go1.22.4"
+        (cd "${PTP_OP_DIR}" && \
+            GOTOOLCHAIN=go1.22.4 GOFLAGS=-mod=mod GOBIN="${TOOLS_BIN}" \
+            go install "sigs.k8s.io/controller-tools/cmd/controller-gen@${cg_pin}")
+    fi
+    ok "controller-gen ${cg_pin} installed"
 }
 
 # --- Build a file-based catalog directly, decoupled from repo Makefiles ---
