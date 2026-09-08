@@ -28,6 +28,7 @@ set -euo pipefail
 REGISTRY="quay.io/vgrinber"
 VERSION="5.0"
 CHANNEL="alpha"
+MIN_KUBE_VERSION="1.33.0"
 
 LPTPD_IMG="quay.io/vgrinber/linuxptp-daemon:main"
 KRP_IMG="quay.io/openshift/origin-kube-rbac-proxy:5.0"
@@ -79,6 +80,8 @@ BUILD/DEPLOY FLAGS
     --registry <path>   Registry prefix               (default: quay.io/vgrinber)
     --version <ver>     Operator version               (default: 5.0)
     --channel <name>    OLM bundle channel             (default: alpha)
+    --min-kube-version <ver>
+                        CSV spec.minKubeVersion (default: 1.33.0)
     --build             Build operator image only
     --push              Push operator + bundle + catalog images
     --deploy            Deploy catalog to cluster only
@@ -160,6 +163,26 @@ ensure_tools() {
     ok "Toolchain ready (opm + yq on PATH)"
 }
 
+# --- Patch generated CSV after 'make bundle' ---
+# 1. Lower spec.minKubeVersion so OLM will install on older clusters
+#    (the base template hardcodes 1.35.0, which fails on 1.33.x servers).
+# 2. Declare spec.relatedImages explicitly.  OLM only auto-discovers
+#    images from container 'image:' fields, so the component images that
+#    the operator pulls via env vars would otherwise be absent.
+patch_csv() {
+    local csv_file="$1"
+    yq -i \
+        '.spec.minKubeVersion = "'"${MIN_KUBE_VERSION}"'" |
+         .spec.relatedImages = [
+           {"name": "ptp-operator",       "image": "'"${OPERATOR_IMG}"'"},
+           {"name": "linuxptp-daemon",    "image": "'"${LPTPD_IMG}"'"},
+           {"name": "kube-rbac-proxy",    "image": "'"${KRP_IMG}"'"},
+           {"name": "cloud-event-proxy",  "image": "'"${CEP_IMG}"'"}
+         ]' \
+        "${csv_file}"
+    ok "Patched ${csv_file} (minKubeVersion=${MIN_KUBE_VERSION}, relatedImages added)"
+}
+
 # --- Parse arguments ---
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -167,6 +190,7 @@ while [[ $# -gt 0 ]]; do
         --registry)     REGISTRY="$2";     shift 2 ;;
         --version)      VERSION="$2";      shift 2 ;;
         --channel)      CHANNEL="$2";      shift 2 ;;
+        --min-kube-version) MIN_KUBE_VERSION="$2"; shift 2 ;;
         --lptpd-img)    LPTPD_IMG="$2";    shift 2 ;;
         --krp-img)      KRP_IMG="$2";      shift 2 ;;
         --cep-img)      CEP_IMG="$2";      shift 2 ;;
@@ -215,6 +239,7 @@ echo "============================================"
 echo "  Registry  : ${REGISTRY}"
 echo "  Version   : ${VERSION}"
 echo "  Channel   : ${CHANNEL}"
+echo "  MinKube   : ${MIN_KUBE_VERSION}"
 echo ""
 echo "  Operator image  : ${OPERATOR_IMG}"
 echo "  Bundle image    : ${BUNDLE_IMG}"
@@ -256,6 +281,9 @@ fi
 # ============================================================
 if $DO_BUILD || $DO_PUSH; then
 
+    # Ensure opm + yq are available (yq is needed to patch the CSV below)
+    ensure_tools
+
     # Patch env.yaml with the provided component image pull specs.
     # 'make update-env.yaml' modifies config/manager/env.yaml in-place,
     # creating a .bak backup.  'make bundle' runs this target, generates
@@ -290,6 +318,17 @@ if $DO_BUILD || $DO_PUSH; then
     )
     ok "OLM bundle generated"
 
+    # Patch the generated CSV: lower minKubeVersion for older clusters and
+    # declare relatedImages (component images are env-var-only, so OLM won't
+    # discover them otherwise).
+    info "Patching CSV (minKubeVersion=${MIN_KUBE_VERSION}, adding relatedImages)"
+    for csv in "${PTP_OP_DIR}"/bundle/manifests/*.clusterserviceversion.yaml; do
+        patch_csv "${csv}"
+    done
+    for csv in "${PTP_OP_DIR}"/manifests/stable/*.clusterserviceversion.yaml; do
+        patch_csv "${csv}"
+    done
+
     # Build the bundle image (FROM scratch, contains CSV + CRDs + metadata)
     info "Building bundle image: ${BUNDLE_IMG}"
     (
@@ -311,9 +350,6 @@ if $DO_BUILD || $DO_PUSH; then
         make bundle-push
     )
     ok "Bundle image pushed"
-
-    # Ensure opm and yq are available (required by catalog targets)
-    ensure_tools
 
     # Generate catalog metadata files
     info "Generating catalog metadata"
