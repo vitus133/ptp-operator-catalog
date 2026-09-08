@@ -275,6 +275,13 @@ if $DO_BUILD || $DO_PUSH; then
     )
     ok "Bundle image pushed"
 
+    # Ensure opm is available (Makefile catalog targets don't depend on it)
+    info "Ensuring opm is installed"
+    (
+        cd "${PTP_OP_DIR}"
+        make opm
+    )
+
     # Generate catalog metadata files
     info "Generating catalog metadata"
     (
