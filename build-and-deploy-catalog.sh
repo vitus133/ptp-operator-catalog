@@ -123,6 +123,43 @@ EOF
     exit 0
 }
 
+# --- Ensure toolchain: opm (via make), yq (manual download) ---
+# The Makefile's catalog targets invoke bare 'opm' and 'yq' (not $(OPM)/
+# $(YQ)), and neither has a download target.  We bootstrap both into
+# ${PTP_OP_DIR}/bin and add it to PATH so those bare calls resolve.
+ensure_tools() {
+    info "Ensuring opm is installed"
+    (
+        cd "${PTP_OP_DIR}"
+        make opm
+    )
+
+    TOOLS_BIN="${PTP_OP_DIR}/bin"
+    mkdir -p "${TOOLS_BIN}"
+
+    if [[ ! -x "${TOOLS_BIN}/yq" ]]; then
+        info "Downloading yq to ${TOOLS_BIN}/yq"
+        local yq_os yq_arch
+        case "$(uname -s)" in
+            Linux)  yq_os="linux" ;;
+            Darwin) yq_os="darwin" ;;
+            *)      yq_os="linux" ;;
+        esac
+        case "$(uname -m)" in
+            x86_64|amd64) yq_arch="amd64" ;;
+            aarch64|arm64) yq_arch="arm64" ;;
+            *)             yq_arch="amd64" ;;
+        esac
+        curl -sSLo "${TOOLS_BIN}/yq" \
+            "https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_${yq_os}_${yq_arch}"
+        chmod +x "${TOOLS_BIN}/yq"
+        ok "yq installed"
+    fi
+
+    export PATH="${TOOLS_BIN}:${PATH}"
+    ok "Toolchain ready (opm + yq on PATH)"
+}
+
 # --- Parse arguments ---
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -275,12 +312,8 @@ if $DO_BUILD || $DO_PUSH; then
     )
     ok "Bundle image pushed"
 
-    # Ensure opm is available (Makefile catalog targets don't depend on it)
-    info "Ensuring opm is installed"
-    (
-        cd "${PTP_OP_DIR}"
-        make opm
-    )
+    # Ensure opm and yq are available (required by catalog targets)
+    ensure_tools
 
     # Generate catalog metadata files
     info "Generating catalog metadata"
