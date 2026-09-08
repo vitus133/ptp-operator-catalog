@@ -79,6 +79,7 @@ COMPONENT IMAGE FLAGS
 BUILD/DEPLOY FLAGS
     --registry <path>   Registry prefix               (default: quay.io/vgrinber)
     --version <ver>     Operator version               (default: 5.0)
+    --auto-version       Pull latest bundle from registry and increment version
     --channel <name>    OLM bundle channel             (default: alpha)
     --min-kube-version <ver>
                         CSV spec.minKubeVersion (default: 1.33.0)
@@ -183,12 +184,57 @@ patch_csv() {
     ok "Patched ${csv_file} (minKubeVersion=${MIN_KUBE_VERSION}, relatedImages added)"
 }
 
+# --- Auto-increment version from registry ---
+# Queries the bundle image tags in the registry, finds the latest vX.Y,
+# and increments the minor version (5.0 → 5.1, 5.1 → 5.2, etc.).
+get_next_version() {
+    local registry="$1"
+    local bundle_repo="${registry}/ptp-operator-bundle"
+    local default_version="$2"
+
+    if ! command -v skopeo >/dev/null 2>&1; then
+        warn "skopeo not found, using default version: ${default_version}"
+        echo "${default_version}"
+        return
+    fi
+
+    info "Querying registry for latest bundle version: ${bundle_repo}"
+    local tags_json
+    tags_json=$(skopeo list-tags "docker://${bundle_repo}" 2>/dev/null) || {
+        warn "Could not list tags (repo may not exist yet), using default version: ${default_version}"
+        echo "${default_version}"
+        return
+    }
+
+    # Extract version tags matching vX.Y pattern, sort, take the highest
+    local latest
+    latest=$(echo "${tags_json}" | jq -r '.Tags[]' 2>/dev/null \
+        | grep -E '^v[0-9]+\.[0-9]+$' \
+        | sort -t. -k1,1n -k2,2n \
+        | tail -1)
+
+    if [[ -z "$latest" ]]; then
+        warn "No version tags found, using default version: ${default_version}"
+        echo "${default_version}"
+        return
+    fi
+
+    # Increment minor version: v5.0 → 5.1
+    local current="${latest#v}"
+    local major minor
+    IFS='.' read -r major minor <<< "$current"
+    local next="${major}.$(( ${minor:-0} + 1 ))"
+    ok "Latest bundle: ${latest} → next version: ${next}"
+    echo "${next}"
+}
+
 # --- Parse arguments ---
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help)      usage ;;
         --registry)     REGISTRY="$2";     shift 2 ;;
         --version)      VERSION="$2";      shift 2 ;;
+        --auto-version) AUTO_VERSION=true; shift ;;
         --channel)      CHANNEL="$2";      shift 2 ;;
         --min-kube-version) MIN_KUBE_VERSION="$2"; shift 2 ;;
         --lptpd-img)    LPTPD_IMG="$2";    shift 2 ;;
@@ -207,6 +253,11 @@ done
 LPTPD_IMG="${LPTPD_IMG:-${REGISTRY}/lptpd:latest}"
 KRP_IMG="${KRP_IMG:-${REGISTRY}/krp:latest}"
 CEP_IMG="${CEP_IMG:-${REGISTRY}/cep:latest}"
+
+# --- Auto-increment version if requested ---
+if ${AUTO_VERSION:-false}; then
+    VERSION="$(get_next_version "${REGISTRY}" "${VERSION}")"
+fi
 
 # Default to --all when no action flags specified
 if ! $DO_BUILD && ! $DO_PUSH && ! $DO_DEPLOY && ! $DO_UNDEPLOY && ! $DO_ALL; then
@@ -391,6 +442,17 @@ fi
 # Phase 4: Deploy / undeploy catalog to cluster
 # ============================================================
 if $DO_DEPLOY; then
+    # Clean existing OLM resources so OLM re-resolves from the new catalog.
+    # Without this, OLM caches the old bundle by image reference and won't
+    # pick up changes when the tag stays the same.
+    info "Cleaning existing OLM resources"
+    oc delete clusteroperator ptp-operator -n openshift-ptp --ignore-not-found 2>/dev/null || true
+    oc delete csv -l operators.coreos.com/ptp-operator.openshift-ptp -n openshift-ptp --ignore-not-found 2>/dev/null || true
+    oc delete subscription ptp-operator -n openshift-ptp --ignore-not-found 2>/dev/null || true
+    oc delete catalogsource ptp-operator-catalog -n openshift-marketplace --ignore-not-found 2>/dev/null || true
+    oc delete clustercatalog ptp-operator-catalog -n openshift-marketplace --ignore-not-found 2>/dev/null || true
+    ok "Existing OLM resources cleaned"
+
     info "Deploying catalog to cluster: ${CATALOG_IMG}"
     (
         cd "${PTP_OP_DIR}"
