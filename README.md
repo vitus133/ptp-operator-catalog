@@ -153,6 +153,10 @@ When component image flags are omitted, these defaults are used
 ptp-work/
 ├── ptp-operator-catalog/
 │   ├── build-and-deploy-catalog.sh    ← this script
+│   ├── extra-manifests/               ← applied on --deploy (lexical order)
+│   │   ├── ns.yaml                    ← openshift-ptp Namespace
+│   │   ├── og.yaml                    ← OperatorGroup
+│   │   └── subscription.yaml          ← Subscription → installs operator
 │   └── DEADME.md                      ← this file
 └── np-ptp-operator/
     ├── Dockerfile                     ← operator image build

@@ -27,9 +27,10 @@ set -euo pipefail
 
 # --- Defaults ---
 REGISTRY="quay.io/vgrinber"
-VERSION="5.0"
+VERSION="5.0.0"
 CHANNEL="alpha"
 MIN_KUBE_VERSION="1.33.0"
+AUTO_VERSION=true
 
 LPTPD_IMG="quay.io/vgrinber/linuxptp-daemon:main"
 KRP_IMG="quay.io/openshift/origin-kube-rbac-proxy:5.0"
@@ -79,8 +80,9 @@ COMPONENT IMAGE FLAGS
 
 BUILD/DEPLOY FLAGS
     --registry <path>   Registry prefix               (default: quay.io/vgrinber)
-    --version <ver>     Operator version               (default: 5.0)
-    --auto-version       Pull latest bundle from registry and increment version
+    --version <ver>     Operator version               (default: 5.0.0)
+    --auto-version       Pull latest bundle from registry and increment version (default)
+    --no-auto-version    Use --version as-is, do not auto-increment
     --min-kube-version <ver>
                         CSV spec.minKubeVersion (default: 1.33.0)
     --build             Build operator image only
@@ -89,6 +91,9 @@ BUILD/DEPLOY FLAGS
     --undeploy          Remove catalog from cluster
     --all               Build + push + deploy           (default)
     -h, --help          Show this help
+
+    On --deploy, every *.yaml under ./extra-manifests/ is applied in
+    lexical order (namespace, OperatorGroup, Subscription, etc.).
 
 EXAMPLES
     # Full build with upstream component images
@@ -185,8 +190,9 @@ patch_csv() {
 }
 
 # --- Auto-increment version from registry ---
-# Queries the bundle image tags in the registry, finds the latest vX.Y,
-# and increments the minor version (5.0 → 5.1, 5.1 → 5.2, etc.).
+# Queries the bundle image tags in the registry, finds the latest vX.Y.Z
+# (OLM uses symbolic semver versions), and increments the patch version
+# (5.0.0 → 5.0.1, 5.0.1 → 5.0.2, etc.).
 # IMPORTANT: this function prints ONLY the computed version to stdout.
 # All logging must go to stderr, because the caller captures stdout via
 # $(...) — anything else on stdout corrupts the returned version.
@@ -209,11 +215,13 @@ get_next_version() {
         return
     }
 
-    # Extract version tags matching vX.Y pattern, sort, take the highest
+    # Extract version tags matching vX.Y or vX.Y.Z, normalizing vX.Y to
+    # vX.Y.0 so both forms sort correctly together, then take the highest.
     local latest
     latest=$(echo "${tags_json}" | jq -r '.Tags[]' 2>/dev/null \
-        | grep -E '^v[0-9]+\.[0-9]+$' \
-        | sort -t. -k1,1n -k2,2n \
+        | grep -E '^v[0-9]+\.[0-9]+(\.[0-9]+)?$' \
+        | sed -E 's/^v([0-9]+\.[0-9]+)$/v\1.0/' \
+        | sort -t. -k1,1n -k2,2n -k3,3n \
         | tail -1)
 
     if [[ -z "$latest" ]]; then
@@ -222,11 +230,12 @@ get_next_version() {
         return
     fi
 
-    # Increment minor version: v5.0 → 5.1
+    # Increment patch version: v5.2.0 → 5.2.1
     local current="${latest#v}"
-    local major minor
-    IFS='.' read -r major minor <<< "$current"
-    local next="${major}.$(( ${minor:-0} + 1 ))"
+    local major minor patch
+    IFS='.' read -r major minor patch <<< "$current"
+    patch="${patch:-0}"
+    local next="${major}.${minor}.$(( patch + 1 ))"
     echo "OK    Latest bundle: ${latest} → next version: ${next}" >&2
     echo "${next}"
 }
@@ -237,7 +246,8 @@ while [[ $# -gt 0 ]]; do
         -h|--help)      usage ;;
         --registry)     REGISTRY="$2";     shift 2 ;;
         --version)      VERSION="$2";      shift 2 ;;
-        --auto-version) AUTO_VERSION=true; shift ;;
+        --auto-version) AUTO_VERSION=true;  shift ;;
+        --no-auto-version) AUTO_VERSION=false; shift ;;
         --min-kube-version) MIN_KUBE_VERSION="$2"; shift 2 ;;
         --lptpd-img)    LPTPD_IMG="$2";    shift 2 ;;
         --krp-img)      KRP_IMG="$2";      shift 2 ;;
@@ -256,8 +266,8 @@ LPTPD_IMG="${LPTPD_IMG:-${REGISTRY}/lptpd:latest}"
 KRP_IMG="${KRP_IMG:-${REGISTRY}/krp:latest}"
 CEP_IMG="${CEP_IMG:-${REGISTRY}/cep:latest}"
 
-# --- Auto-increment version if requested ---
-if ${AUTO_VERSION:-false}; then
+# --- Auto-increment version (default on; disable with --no-auto-version) ---
+if $AUTO_VERSION; then
     VERSION="$(get_next_version "${REGISTRY}" "${VERSION}")"
 fi
 
@@ -463,13 +473,21 @@ if $DO_DEPLOY; then
     )
     ok "Catalog deployed"
 
-    # Apply namespace, OperatorGroup and Subscription so the operator
-    # actually installs.  The CatalogSource alone is not enough.
-    info "Applying namespace / OperatorGroup / Subscription"
-    oc apply -f "${SCRIPT_DIR}/ns.yaml"     2>/dev/null || true
-    oc apply -f "${SCRIPT_DIR}/og.yaml"     2>/dev/null || true
-    oc apply -f "${SCRIPT_DIR}/subscription.yaml" 2>/dev/null || true
-    ok "Namespace / OperatorGroup / Subscription applied"
+    # Apply everything under extra-manifests/ (namespace, OperatorGroup,
+    # Subscription, or any custom manifests the user drops in there).
+    # Files are applied in lexical order.
+    EXTRA_MANIFESTS="${SCRIPT_DIR}/extra-manifests"
+    if [[ -d "${EXTRA_MANIFESTS}" && -n "$(ls -A "${EXTRA_MANIFESTS}" 2>/dev/null)" ]]; then
+        info "Applying manifests from ${EXTRA_MANIFESTS}"
+        for manifest in "${EXTRA_MANIFESTS}"/*.yaml; do
+            [[ -e "${manifest}" ]] || continue
+            info "  Applying $(basename "${manifest}")"
+            ok "$(oc apply -f "${manifest}")"
+        done
+        ok "Extra manifests applied"
+    else
+        warn "No extra-manifests directory or it is empty — skipping"
+    fi
 fi
 
 if $DO_UNDEPLOY; then
