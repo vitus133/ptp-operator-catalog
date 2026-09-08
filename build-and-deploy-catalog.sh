@@ -377,6 +377,7 @@ if $DO_BUILD || $DO_PUSH; then
         VERSION="${VERSION}" \
         CHANNELS="${CHANNEL}" \
         DEFAULT_CHANNEL="${CHANNEL}" \
+        BUNDLE_VERSION="${VERSION}" \
         make bundle
     )
     ok "OLM bundle generated"
