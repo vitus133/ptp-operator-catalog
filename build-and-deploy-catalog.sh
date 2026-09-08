@@ -22,6 +22,7 @@ set -euo pipefail
 # Usage:
 #   cd ptp-work
 #   ./ptp-operator-catalog/build-and-deploy-catalog.sh [options]
+# ./ptp-operator-catalog/build-and-deploy-catalog.sh --auto-version --build --push --deploy
 # ============================================================
 
 # --- Defaults ---
