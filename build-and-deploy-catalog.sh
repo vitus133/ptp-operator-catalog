@@ -188,21 +188,24 @@ patch_csv() {
 # --- Auto-increment version from registry ---
 # Queries the bundle image tags in the registry, finds the latest vX.Y,
 # and increments the minor version (5.0 → 5.1, 5.1 → 5.2, etc.).
+# IMPORTANT: this function prints ONLY the computed version to stdout.
+# All logging must go to stderr, because the caller captures stdout via
+# $(...) — anything else on stdout corrupts the returned version.
 get_next_version() {
     local registry="$1"
     local bundle_repo="${registry}/ptp-operator-bundle"
     local default_version="$2"
 
     if ! command -v skopeo >/dev/null 2>&1; then
-        warn "skopeo not found, using default version: ${default_version}"
+        warn "skopeo not found, using default version: ${default_version}" >&2
         echo "${default_version}"
         return
     fi
 
-    info "Querying registry for latest bundle version: ${bundle_repo}"
+    echo "INFO  Querying registry for latest bundle version: ${bundle_repo}" >&2
     local tags_json
     tags_json=$(skopeo list-tags "docker://${bundle_repo}" 2>/dev/null) || {
-        warn "Could not list tags (repo may not exist yet), using default version: ${default_version}"
+        echo "WARN  Could not list tags (repo may not exist yet), using default version: ${default_version}" >&2
         echo "${default_version}"
         return
     }
@@ -215,7 +218,7 @@ get_next_version() {
         | tail -1)
 
     if [[ -z "$latest" ]]; then
-        warn "No version tags found, using default version: ${default_version}"
+        echo "WARN  No version tags found, using default version: ${default_version}" >&2
         echo "${default_version}"
         return
     fi
@@ -225,7 +228,7 @@ get_next_version() {
     local major minor
     IFS='.' read -r major minor <<< "$current"
     local next="${major}.$(( ${minor:-0} + 1 ))"
-    ok "Latest bundle: ${latest} → next version: ${next}"
+    echo "OK    Latest bundle: ${latest} → next version: ${next}" >&2
     echo "${next}"
 }
 
