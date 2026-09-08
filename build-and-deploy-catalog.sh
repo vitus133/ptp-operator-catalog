@@ -474,13 +474,13 @@ if $DO_BUILD || $DO_PUSH; then
             make update-env-yaml
         )
     else
-        # Legacy: back up env.yaml, patch the three image values in place
+        # Legacy: back up env.yaml, patch the three image values in place.
+        # Use one select() assignment per var (the if/elif form fails to
+        # lex in yq).
         cp "${ENV_YAML}" "${ENV_YAML}.bak"
-        yq -i '.spec.template.spec.containers[].env[] |= (
-            if .name == "LINUXPTP_DAEMON_IMAGE" then .value = "'"${LPTPD_IMG}"'"
-            elif .name == "KUBE_RBAC_PROXY_IMAGE" then .value = "'"${KRP_IMG}"'"
-            elif .name == "SIDECAR_EVENT_IMAGE" then .value = "'"${CEP_IMG}"'"
-            else . end)' "${ENV_YAML}"
+        yq -i '( .spec.template.spec.containers[].env[] | select(.name == "LINUXPTP_DAEMON_IMAGE") | .value ) = "'"${LPTPD_IMG}"'"' "${ENV_YAML}"
+        yq -i '( .spec.template.spec.containers[].env[] | select(.name == "KUBE_RBAC_PROXY_IMAGE") | .value ) = "'"${KRP_IMG}"'"' "${ENV_YAML}"
+        yq -i '( .spec.template.spec.containers[].env[] | select(.name == "SIDECAR_EVENT_IMAGE") | .value ) = "'"${CEP_IMG}"'"' "${ENV_YAML}"
     fi
     ok "env.yaml patched"
 
