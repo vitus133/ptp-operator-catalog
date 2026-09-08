@@ -165,26 +165,33 @@ ensure_tools() {
     TOOLS_BIN="${PTP_OP_DIR}/bin"
     mkdir -p "${TOOLS_BIN}"
 
-    # Always ensure opm is the modern file-based-catalog capable version
-    if [[ ! -x "${TOOLS_BIN}/opm" ]]; then
+    # opm must be a modern build that supports the file-based catalog
+    # subcommand 'opm init'.  The legacy repo's 'make opm' drops in old
+    # v1.15.1 which only knows 'index add' — detect and replace it.
+    local opm_os opm_arch
+    case "$(uname -s)" in
+        Linux)  opm_os="linux" ;;
+        Darwin) opm_os="darwin" ;;
+        *)      opm_os="linux" ;;
+    esac
+    case "$(uname -m)" in
+        x86_64|amd64) opm_arch="amd64" ;;
+        aarch64|arm64) opm_arch="arm64" ;;
+        *)             opm_arch="amd64" ;;
+    esac
+
+    if [[ -x "${TOOLS_BIN}/opm" ]] && \
+        "${TOOLS_BIN}/opm" init --help >/dev/null 2>&1; then
+        ok "opm already present (supports file-based catalogs)"
+    else
+        if [[ -x "${TOOLS_BIN}/opm" ]]; then
+            warn "Existing opm lacks 'init' (file-based catalogs) — replacing with ${OPM_VERSION}"
+        fi
         info "Downloading opm ${OPM_VERSION} to ${TOOLS_BIN}/opm"
-        local opm_os opm_arch
-        case "$(uname -s)" in
-            Linux)  opm_os="linux" ;;
-            Darwin) opm_os="darwin" ;;
-            *)      opm_os="linux" ;;
-        esac
-        case "$(uname -m)" in
-            x86_64|amd64) opm_arch="amd64" ;;
-            aarch64|arm64) opm_arch="arm64" ;;
-            *)             opm_arch="amd64" ;;
-        esac
         curl -sSLo "${TOOLS_BIN}/opm" \
             "https://github.com/operator-framework/operator-registry/releases/download/${OPM_VERSION}/${opm_os}-${opm_arch}-opm"
         chmod +x "${TOOLS_BIN}/opm"
         ok "opm installed"
-    else
-        ok "opm already present"
     fi
 
     if [[ ! -x "${TOOLS_BIN}/yq" ]]; then
