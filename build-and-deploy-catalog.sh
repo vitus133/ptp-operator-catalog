@@ -81,7 +81,6 @@ BUILD/DEPLOY FLAGS
     --registry <path>   Registry prefix               (default: quay.io/vgrinber)
     --version <ver>     Operator version               (default: 5.0)
     --auto-version       Pull latest bundle from registry and increment version
-    --channel <name>    OLM bundle channel             (default: alpha)
     --min-kube-version <ver>
                         CSV spec.minKubeVersion (default: 1.33.0)
     --build             Build operator image only
@@ -239,7 +238,6 @@ while [[ $# -gt 0 ]]; do
         --registry)     REGISTRY="$2";     shift 2 ;;
         --version)      VERSION="$2";      shift 2 ;;
         --auto-version) AUTO_VERSION=true; shift ;;
-        --channel)      CHANNEL="$2";      shift 2 ;;
         --min-kube-version) MIN_KUBE_VERSION="$2"; shift 2 ;;
         --lptpd-img)    LPTPD_IMG="$2";    shift 2 ;;
         --krp-img)      KRP_IMG="$2";      shift 2 ;;
@@ -464,6 +462,14 @@ if $DO_DEPLOY; then
         make catalog-deploy
     )
     ok "Catalog deployed"
+
+    # Apply namespace, OperatorGroup and Subscription so the operator
+    # actually installs.  The CatalogSource alone is not enough.
+    info "Applying namespace / OperatorGroup / Subscription"
+    oc apply -f "${SCRIPT_DIR}/ns.yaml"     2>/dev/null || true
+    oc apply -f "${SCRIPT_DIR}/og.yaml"     2>/dev/null || true
+    oc apply -f "${SCRIPT_DIR}/subscription.yaml" 2>/dev/null || true
+    ok "Namespace / OperatorGroup / Subscription applied"
 fi
 
 if $DO_UNDEPLOY; then
@@ -489,5 +495,8 @@ if $DO_DEPLOY; then
     echo "    oc get catalogsource ptp-operator-catalog -n openshift-marketplace"
     echo "    oc get clustercatalog ptp-operator-catalog"
     echo "    oc get packagemanifest ptp-operator"
+    echo "    oc get subscription ptp-operator -n openshift-ptp"
+    echo "    oc get csv -n openshift-ptp"
+    echo "    oc get pods -n openshift-ptp"
 fi
 echo "============================================"
