@@ -27,14 +27,14 @@ set -euo pipefail
 
 # --- Defaults ---
 REGISTRY="quay.io/vgrinber"
-VERSION="5.0.0"
+VERSION="4.20.0"
 CHANNEL="alpha"
 MIN_KUBE_VERSION="1.33.0"
 AUTO_VERSION=true
 
-LPTPD_IMG="quay.io/vgrinber/linuxptp-daemon:main"
-KRP_IMG="quay.io/openshift/origin-kube-rbac-proxy:5.0"
-CEP_IMG="quay.io/vgrinber/cloud-event-proxy:main"
+LPTPD_IMG="quay.io/vgrinber/linuxptp-daemon:4.20"
+KRP_IMG="quay.io/openshift/origin-kube-rbac-proxy:4.20"
+CEP_IMG="quay.io/vgrinber/cloud-event-proxy:4.20"
 
 DO_BUILD=true
 DO_PUSH=true
@@ -44,7 +44,7 @@ DO_ALL=false
 
 # --- Resolve paths relative to this script ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PTP_OP_DIR="$(cd "${SCRIPT_DIR}/../np-ptp-operator" && pwd)"
+PTP_OP_DIR="$(cd "${SCRIPT_DIR}/../ptp-operator" && pwd)"
 
 # --- Helper functions ---
 
