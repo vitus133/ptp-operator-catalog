@@ -27,10 +27,11 @@ set -euo pipefail
 
 # --- Defaults ---
 REGISTRY="quay.io/vgrinber"
-VERSION="4.20.0"
+VERSION="5.0.0"
 CHANNEL="alpha"
 MIN_KUBE_VERSION="1.33.0"
 AUTO_VERSION=true
+REPO_TYPE="auto"
 
 LPTPD_IMG="quay.io/vgrinber/linuxptp-daemon:4.20"
 KRP_IMG="quay.io/openshift/origin-kube-rbac-proxy:4.20"
@@ -53,6 +54,25 @@ ok()    { echo -e "\033[32mOK\033[0m    $*"; }
 warn()  { echo -e "\033[33mWARN\033[0m  $*"; }
 error() { echo -e "\033[31mERROR\033[0m $*" >&2; }
 die()   { error "$@"; exit 1; }
+
+# --- Detect which ptp-operator repo we are operating on ---
+# "new"    = np-ptp-operator (OCP 5.0): file-based catalog, update-env-yaml
+#            make targets, catalog-deploy target exists.
+# "legacy" = ptp-operator (OCP 4.x): opm index add catalog, no
+#            update-env-yaml, no catalog-deploy target.
+detect_repo_type() {
+    case "$REPO_TYPE" in
+        new|legacy) return ;;
+    esac
+    if grep -qE "^update-env-yaml:" "${PTP_OP_DIR}/Makefile"; then
+        REPO_TYPE="new"
+    elif grep -qE "opm.*index add" "${PTP_OP_DIR}/Makefile"; then
+        REPO_TYPE="legacy"
+    else
+        die "Cannot auto-detect repo type in ${PTP_OP_DIR}; use --repo new|legacy"
+    fi
+    info "Auto-detected repo type: ${REPO_TYPE}"
+}
 
 usage() {
     cat <<'EOF'
@@ -80,6 +100,8 @@ COMPONENT IMAGE FLAGS
 
 BUILD/DEPLOY FLAGS
     --registry <path>   Registry prefix               (default: quay.io/vgrinber)
+    --repo <type>       Repo type: new | legacy | auto  (default: auto)
+                        auto detects from the Makefile
     --version <ver>     Operator version               (default: 5.0.0)
     --auto-version       Pull latest bundle from registry and increment version (default)
     --no-auto-version    Use --version as-is, do not auto-increment
@@ -132,19 +154,38 @@ EOF
     exit 0
 }
 
-# --- Ensure toolchain: opm (via make), yq (manual download) ---
-# The Makefile's catalog targets invoke bare 'opm' and 'yq' (not $(OPM)/
-# $(YQ)), and neither has a download target.  We bootstrap both into
-# ${PTP_OP_DIR}/bin and add it to PATH so those bare calls resolve.
-ensure_tools() {
-    info "Ensuring opm is installed"
-    (
-        cd "${PTP_OP_DIR}"
-        make opm
-    )
+# --- Ensure toolchain: opm (v1.60 for file-based catalogs), yq ---
+# The legacy repo's Makefile downloads opm v1.15.1 which only supports
+# SQLite (opm index add), not file-based catalogs.  We download a modern
+# opm ourselves and add it to PATH so the file-based catalog flow works
+# for BOTH repos regardless of the repo Makefile version.
+OPM_VERSION="v1.60.0"
 
+ensure_tools() {
     TOOLS_BIN="${PTP_OP_DIR}/bin"
     mkdir -p "${TOOLS_BIN}"
+
+    # Always ensure opm is the modern file-based-catalog capable version
+    if [[ ! -x "${TOOLS_BIN}/opm" ]]; then
+        info "Downloading opm ${OPM_VERSION} to ${TOOLS_BIN}/opm"
+        local opm_os opm_arch
+        case "$(uname -s)" in
+            Linux)  opm_os="linux" ;;
+            Darwin) opm_os="darwin" ;;
+            *)      opm_os="linux" ;;
+        esac
+        case "$(uname -m)" in
+            x86_64|amd64) opm_arch="amd64" ;;
+            aarch64|arm64) opm_arch="arm64" ;;
+            *)             opm_arch="amd64" ;;
+        esac
+        curl -sSLo "${TOOLS_BIN}/opm" \
+            "https://github.com/operator-framework/operator-registry/releases/download/${OPM_VERSION}/${opm_os}-${opm_arch}-opm"
+        chmod +x "${TOOLS_BIN}/opm"
+        ok "opm installed"
+    else
+        ok "opm already present"
+    fi
 
     if [[ ! -x "${TOOLS_BIN}/yq" ]]; then
         info "Downloading yq to ${TOOLS_BIN}/yq"
@@ -166,7 +207,70 @@ ensure_tools() {
     fi
 
     export PATH="${TOOLS_BIN}:${PATH}"
-    ok "Toolchain ready (opm + yq on PATH)"
+    ok "Toolchain ready (opm ${OPM_VERSION} + yq on PATH)"
+}
+
+# --- Build a file-based catalog directly, decoupled from repo Makefiles ---
+# Uses opm DIRECTLY (no reliance on 'make catalog/...' targets) so the
+# same file-based catalog flow works for the np-ptp-operator and legacy
+# ptp-operator repos alike.  Creates <catalog_dir> in the catalog project
+# and builds <CATALOG_IMG> from it.
+build_fbc_catalog() {
+    local catalog_dir="${SCRIPT_DIR}/catalog"
+
+    rm -rf "${catalog_dir}"
+    mkdir -p "${catalog_dir}"
+
+    # olm.package + olm.channel metadata
+    local readme="${PTP_OP_DIR}/README.md"
+    [[ -f "${readme}" ]] || readme="${SCRIPT_DIR}/README.md"
+    info "opm init ptp-operator (channel=${CHANNEL})"
+    "${TOOLS_BIN}/opm" init ptp-operator \
+        --default-channel="${CHANNEL}" \
+        --output=yaml \
+        --description="${readme}" \
+        > "${catalog_dir}/index.yaml"
+
+    # Bundle entries
+    info "opm render ${BUNDLE_IMG}"
+    "${TOOLS_BIN}/opm" render "${BUNDLE_IMG}" --output=yaml \
+        > "${catalog_dir}/operator.yaml"
+
+    # Channel entry (name must match the bundle's CSV version)
+    local bundle_version
+    bundle_version="$(yq -r '.properties[] | select(.type == "olm.package") | .value.version' "${catalog_dir}/operator.yaml")"
+    cat > "${catalog_dir}/channel.yaml" <<EOF
+---
+schema: olm.channel
+package: ptp-operator
+channel: ${CHANNEL}
+name: ${CHANNEL}
+entries:
+  - name: ptp-operator.v${bundle_version}
+    skipRange: ">=4.3.0-0 <${bundle_version}"
+EOF
+
+    # Validate the file-based catalog
+    info "Validating file-based catalog"
+    "${TOOLS_BIN}/opm" validate "${catalog_dir}"
+
+    # Generate the Dockerfile (writes ${SCRIPT_DIR}/catalog.Dockerfile,
+    # with the catalog dir added into the image at /configs)
+    info "Generating catalog Dockerfile"
+    (
+        cd "${SCRIPT_DIR}"
+        "${TOOLS_BIN}/opm" generate dockerfile catalog
+        ok "Catalog Dockerfile generated"
+    )
+
+    # Build the catalog image from ${SCRIPT_DIR}/catalog
+    info "Building catalog image: ${CATALOG_IMG}"
+    (
+        cd "${SCRIPT_DIR}"
+        CONTAINER_TOOL=podman \
+        podman build -f catalog.Dockerfile -t "${CATALOG_IMG}" .
+    )
+    ok "Catalog image built"
 }
 
 # --- Patch generated CSV after 'make bundle' ---
@@ -245,6 +349,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help)      usage ;;
         --registry)     REGISTRY="$2";     shift 2 ;;
+        --repo)         REPO_TYPE="$2";    shift 2 ;;
         --version)      VERSION="$2";      shift 2 ;;
         --auto-version) AUTO_VERSION=true;  shift ;;
         --no-auto-version) AUTO_VERSION=false; shift ;;
@@ -287,6 +392,9 @@ OPERATOR_IMG="${REGISTRY}/ptp-operator:${VERSION}"
 BUNDLE_IMG="${REGISTRY}/ptp-operator-bundle:v${VERSION}"
 CATALOG_IMG="${REGISTRY}/ptp-operator-catalog:v${VERSION}"
 
+# --- Detect repo type (new np-ptp-operator vs legacy ptp-operator) ---
+detect_repo_type
+
 # --- Pre-flight checks ---
 command -v podman >/dev/null 2>&1 || command -v docker >/dev/null 2>&1 \
     || die "podman or docker required but not found"
@@ -300,6 +408,7 @@ echo "============================================"
 echo " PTP Operator Catalog Builder"
 echo "============================================"
 echo "  Registry  : ${REGISTRY}"
+echo "  Repo      : ${PTP_OP_DIR} (${REPO_TYPE})"
 echo "  Version   : ${VERSION}"
 echo "  Channel   : ${CHANNEL}"
 echo "  MinKube   : ${MIN_KUBE_VERSION}"
@@ -348,38 +457,72 @@ if $DO_BUILD || $DO_PUSH; then
     ensure_tools
 
     # Patch env.yaml with the provided component image pull specs.
-    # 'make update-env.yaml' modifies config/manager/env.yaml in-place,
-    # creating a .bak backup.  'make bundle' runs this target, generates
-    # the CSV, then 'restore-env-yaml' reverts env.yaml so the git
-    # tree stays clean.
+    #   new repo (np-ptp-operator): 'make update-env.yaml' modifies
+    #     config/manager/env.yaml in-place, creating a .bak backup.  The
+    #     'bundle' target generates the CSV then 'restore-env-yaml'
+    #     reverts env.yaml so the git tree stays clean.
+    #   legacy repo (ptp-operator): no update-env-yaml/restore-env-yaml
+    #     targets — patch env.yaml directly with yq and restore manually.
     info "Patching env.yaml with component image references"
-    (
-        cd "${PTP_OP_DIR}"
-        LINUXPTP_DAEMON_IMAGE="${LPTPD_IMG}" \
-        KUBE_RBAC_PROXY_IMAGE="${KRP_IMG}" \
-        SIDECAR_EVENT_IMAGE="${CEP_IMG}" \
-        make update-env-yaml
-    )
+    ENV_YAML="${PTP_OP_DIR}/config/manager/env.yaml"
+    if [[ "$REPO_TYPE" == "new" ]]; then
+        (
+            cd "${PTP_OP_DIR}"
+            LINUXPTP_DAEMON_IMAGE="${LPTPD_IMG}" \
+            KUBE_RBAC_PROXY_IMAGE="${KRP_IMG}" \
+            SIDECAR_EVENT_IMAGE="${CEP_IMG}" \
+            make update-env-yaml
+        )
+    else
+        # Legacy: back up env.yaml, patch the three image values in place
+        cp "${ENV_YAML}" "${ENV_YAML}.bak"
+        yq -i '.spec.template.spec.containers[].env[] |= (
+            if .name == "LINUXPTP_DAEMON_IMAGE" then .value = "'"${LPTPD_IMG}"'"
+            elif .name == "KUBE_RBAC_PROXY_IMAGE" then .value = "'"${KRP_IMG}"'"
+            elif .name == "SIDECAR_EVENT_IMAGE" then .value = "'"${CEP_IMG}"'"
+            else . end)' "${ENV_YAML}"
+    fi
     ok "env.yaml patched"
 
     # Generate the OLM bundle.
-    # The 'bundle' target runs: update-env-yaml → kustomize →
-    # operator-sdk generate bundle → validate → copy to manifests/stable →
-    # restore-env-yaml.  The generated CSV contains:
-    #   - The operator image in spec.install.deployments[].containers[].image
-    #   - Component image pull specs as env var values
+    #   new repo: 'bundle' target runs update-env-yaml → kustomize →
+    #     operator-sdk generate bundle → validate → copy to manifests/stable →
+    #     restore-env-yaml.  BUNDLE_VERSION overrides the default $(VERSION).0.
+    #   legacy repo: no update-env-yaml/restore-env-yaml in the flow, and
+    #     BUNDLE_GEN_FLAGS hardcodes $(VERSION).0.  We override
+    #     BUNDLE_GEN_FLAGS to use the full 3-part version, and must restore
+    #     env.yaml ourselves afterwards.
     info "Generating OLM bundle (VERSION=${VERSION}, CHANNEL=${CHANNEL})"
-    (
-        cd "${PTP_OP_DIR}"
-        CONTAINER_TOOL=podman \
-        IMG="${OPERATOR_IMG}" \
-        ARCH=x86_64 \
-        VERSION="${VERSION}" \
-        CHANNELS="${CHANNEL}" \
-        DEFAULT_CHANNEL="${CHANNEL}" \
-        BUNDLE_VERSION="${VERSION}" \
-        make bundle
-    )
+    if [[ "$REPO_TYPE" == "new" ]]; then
+        (
+            cd "${PTP_OP_DIR}"
+            CONTAINER_TOOL=podman \
+            IMG="${OPERATOR_IMG}" \
+            ARCH=x86_64 \
+            VERSION="${VERSION}" \
+            CHANNELS="${CHANNEL}" \
+            DEFAULT_CHANNEL="${CHANNEL}" \
+            BUNDLE_VERSION="${VERSION}" \
+            make bundle
+        )
+    else
+        (
+            cd "${PTP_OP_DIR}"
+            CONTAINER_TOOL=podman \
+            IMG="${OPERATOR_IMG}" \
+            ARCH=x86_64 \
+            VERSION="${VERSION}" \
+            CHANNELS="${CHANNEL}" \
+            DEFAULT_CHANNEL="${CHANNEL}" \
+            BUNDLE_GEN_FLAGS="-q --overwrite --version ${VERSION} --channels=${CHANNEL} --default-channel=${CHANNEL} --extra-service-accounts linuxptp-daemon" \
+            make bundle
+        )
+        # Legacy bundle target does not restore env.yaml — do it manually
+        if [[ -f "${ENV_YAML}.bak" ]]; then
+            mv "${ENV_YAML}.bak" "${ENV_YAML}"
+            ok "env.yaml restored"
+        fi
+    fi
     ok "OLM bundle generated"
 
     # Patch the generated CSV: lower minKubeVersion for older clusters and
@@ -415,37 +558,16 @@ if $DO_BUILD || $DO_PUSH; then
     )
     ok "Bundle image pushed"
 
-    # Generate catalog metadata files
-    info "Generating catalog metadata"
-    (
-        cd "${PTP_OP_DIR}"
-        BUNDLE_IMGS="${BUNDLE_IMG}" \
-        CATALOG_IMG="${CATALOG_IMG}" \
-        CATALOG_DEFAULT_CHANNEL="${CHANNEL}" \
-        make catalog/index.yaml catalog/operator.yaml catalog/channel.yaml catalog.Dockerfile
-    )
-    ok "Catalog metadata generated"
-
-    # Build and push catalog image
-    info "Building catalog image: ${CATALOG_IMG}"
-    (
-        cd "${PTP_OP_DIR}"
-        CONTAINER_TOOL=podman \
-        BUNDLE_IMGS="${BUNDLE_IMG}" \
-        CATALOG_IMG="${CATALOG_IMG}" \
-        CATALOG_DEFAULT_CHANNEL="${CHANNEL}" \
-        ARCH=x86_64 \
-        make catalog-build
-    )
-    ok "Catalog image built"
+    # Generate the file-based catalog directly and build the catalog image.
+    # Done with opm (v1.60+) so the same flow works for both the
+    # np-ptp-operator and legacy ptp-operator repos, regardless of the
+    # repo Makefile targets.
+    build_fbc_catalog
 
     info "Pushing catalog image: ${CATALOG_IMG}"
     (
         cd "${PTP_OP_DIR}"
-        CONTAINER_TOOL=podman \
-        CATALOG_IMG="${CATALOG_IMG}" \
-        ARCH=x86_64 \
-        make catalog-push
+        CONTAINER_TOOL=podman IMG="${CATALOG_IMG}" ARCH=x86_64 make docker-push
     )
     ok "Catalog image pushed"
 
@@ -467,11 +589,34 @@ if $DO_DEPLOY; then
     ok "Existing OLM resources cleaned"
 
     info "Deploying catalog to cluster: ${CATALOG_IMG}"
-    (
-        cd "${PTP_OP_DIR}"
-        CATALOG_IMG="${CATALOG_IMG}" \
-        make catalog-deploy
-    )
+    # Apply CatalogSource (OLMv0) and ClusterCatalog (OLMv1) directly —
+    # works for both repos and both OCP 4.x / 5.0.  ClusterCatalog may not
+    # exist on 4.x clusters, so tolerate apply failures.
+    oc apply -f - <<EOF
+apiVersion: operators.coreos.com/v1alpha1
+kind: CatalogSource
+metadata:
+  name: ptp-operator-catalog
+  namespace: openshift-marketplace
+spec:
+  sourceType: grpc
+  displayName: Custom PTP Operator catalog
+  publisher: Red Hat (dev)
+  image: ${CATALOG_IMG}
+EOF
+    oc apply -f - >/dev/null 2>&1 <<EOF || warn "ClusterCatalog not supported on this cluster (expected on OCP 4.x)"
+apiVersion: olm.operatorframework.io/v1
+kind: ClusterCatalog
+metadata:
+  name: ptp-operator-catalog
+  namespace: openshift-marketplace
+spec:
+  priority: 1000
+  source:
+    type: Image
+    image:
+      ref: ${CATALOG_IMG}
+EOF
     ok "Catalog deployed"
 
     # Apply everything under extra-manifests/ (namespace, OperatorGroup,
@@ -493,10 +638,8 @@ fi
 
 if $DO_UNDEPLOY; then
     info "Removing catalog from cluster"
-    (
-        cd "${PTP_OP_DIR}"
-        make catalog-undeploy
-    )
+    oc delete clustercatalog ptp-operator-catalog -n openshift-marketplace --ignore-not-found >/dev/null 2>&1 || true
+    oc delete catalogsource ptp-operator-catalog -n openshift-marketplace --ignore-not-found >/dev/null 2>&1 || true
     ok "Catalog removed"
 fi
 
