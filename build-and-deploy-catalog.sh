@@ -27,7 +27,7 @@ set -euo pipefail
 
 # --- Defaults ---
 REGISTRY="quay.io/vgrinber"
-VERSION="5.0.0"
+VERSION="4.20.0"
 CHANNEL="alpha"
 MIN_KUBE_VERSION="1.33.0"
 AUTO_VERSION=true
